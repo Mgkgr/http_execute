@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import ctypes
 import ctypes.wintypes
@@ -30,12 +31,11 @@ import socket
 import sqlite3
 import sys
 import tempfile
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -85,6 +85,7 @@ DB_UPDATE_WINDOW_MIN = 60
 # ---------------------------
 # ВСПОМОГАТЕЛЬНОЕ
 # ---------------------------
+
 
 def _b64url_decode(data: str) -> bytes:
     pad = "=" * (-len(data) % 4)
@@ -165,6 +166,7 @@ def _machine_fingerprint() -> str:
 # ---------------------------
 # TRUSTED TIME (NTP + HTTPS Date)
 # ---------------------------
+
 
 class TrustedTimeError(RuntimeError):
     pass
@@ -258,6 +260,7 @@ def get_trusted_time_utc() -> datetime:
 # DPAPI (Windows) / Fallback store
 # ---------------------------
 
+
 class SecureStoreError(RuntimeError):
     pass
 
@@ -349,6 +352,7 @@ def _entropy_bytes() -> bytes:
 # ---------------------------
 # STATE
 # ---------------------------
+
 
 @dataclass
 class PendingDbUpdate:
@@ -488,6 +492,7 @@ class SecureStateStore:
 # LICENSE TOKENS (Ed25519 signed payload)
 # ---------------------------
 
+
 class LicenseError(RuntimeError):
     pass
 
@@ -596,6 +601,7 @@ class LicenseManager:
 # ---------------------------
 # ENCRYPTED ACCOUNTS DB
 # ---------------------------
+
 
 class DbError(RuntimeError):
     pass
@@ -740,16 +746,30 @@ class AccountsDb:
 
 
 # ---------------------------
-# OTP provider (interactive)
+# OTP providers
 # ---------------------------
+
 
 def otp_provider_interactive(username: str) -> str:
     return input(f"Введите OTP для пользователя {username}: ").strip()
 
 
+def otp_provider_gui(username: str) -> str:
+    import tkinter as tk
+    from tkinter import simpledialog
+
+    root = tk._default_root
+    if root is None:
+        root = tk.Tk()
+        root.withdraw()
+    value = simpledialog.askstring("OTP", f"Введите OTP для пользователя {username}:", parent=root)
+    return (value or "").strip()
+
+
 # ---------------------------
 # MAIN EXECUTION
 # ---------------------------
+
 
 def _configure_logging() -> None:
     try:
@@ -763,19 +783,235 @@ def _configure_logging() -> None:
         )
 
 
-def _run_export(accounts: list[tuple[str, str]]) -> None:
+def _run_export(
+    accounts: list[tuple[str, str]],
+    otp_provider: Callable[[str], str],
+    output_path: Optional[str] = None,
+) -> None:
     # импортируем здесь, чтобы при проблемах с лицензией лишний раз не грузить модули
     from rice.modules.http_complex_control_execute import export_data_for_all_users_http  # :contentReference[oaicite:2]{index=2}
 
-    output = input("Путь сохранения xlsx (Enter = спросит диалог/консоль внутри модуля): ").strip() or None
     export_data_for_all_users_http(
-        output_path=output,
+        output_path=output_path,
         accounts=accounts,
-        otp_provider=otp_provider_interactive,
+        otp_provider=otp_provider,
     )
 
 
-def main() -> None:
+def _require_trusted_time(state: AppState) -> tuple[datetime, AppState]:
+    trusted_now = get_trusted_time_utc()
+    if state.last_trusted_utc:
+        last = datetime.fromisoformat(state.last_trusted_utc)
+        if trusted_now < last - timedelta(seconds=ANTI_ROLLBACK_SKEW_SEC):
+            raise TrustedTimeError("Время 'откатилось' назад относительно сохранённого trusted-time.")
+    state.last_trusted_utc = trusted_now.isoformat()
+    return trusted_now, state
+
+
+class AppUI:
+    def __init__(self, root) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.root = root
+        self.root.title("Rice HTTP CC Standalone")
+        self.root.geometry("640x420")
+
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.status_machine = tk.StringVar()
+        self.status_license = tk.StringVar()
+        self.status_db = tk.StringVar()
+        self.status_time = tk.StringVar()
+        self.status_pending = tk.StringVar()
+
+        header = ttk.Frame(self.root, padding=10)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(header, text="Rice HTTP CC Standalone", font=("Segoe UI", 14, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(header, text="Обновить время", command=self.refresh_time).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        body = ttk.Frame(self.root, padding=10)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Машина:").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.status_machine).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(body, text="Лицензия до (UTC):").grid(row=1, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.status_license).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(body, text="Версия базы:").grid(row=2, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.status_db).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(body, text="Trusted time (UTC):").grid(row=3, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.status_time).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(body, text="DB_UPDATE окно:").grid(row=4, column=0, sticky="w")
+        ttk.Label(body, textvariable=self.status_pending).grid(row=4, column=1, sticky="w")
+
+        actions = ttk.LabelFrame(body, text="Действия", padding=10)
+        actions.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(16, 0))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        ttk.Button(actions, text="Ввести код", command=self.apply_code).grid(row=0, column=0, sticky="ew")
+        ttk.Button(actions, text="Импорт базы", command=self.import_db).grid(row=0, column=1, sticky="ew")
+        ttk.Button(actions, text="Запустить экспорт", command=self.run_export).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(actions, text="Выход", command=self._on_close).grid(row=1, column=1, sticky="ew", pady=(8, 0))
+
+        self.root.rowconfigure(2, weight=0)
+        footer = ttk.Frame(self.root, padding=10)
+        footer.grid(row=2, column=0, sticky="ew")
+        self.status_bar = tk.StringVar(value="Готово")
+        ttk.Label(footer, textvariable=self.status_bar, foreground="#555").grid(row=0, column=0, sticky="w")
+
+        self.store = SecureStateStore(_app_data_dir())
+        self.state = self.store.load()
+        if not self.state.machine_id:
+            self.state.machine_id = _machine_fingerprint()
+
+        self.lic = LicenseManager(PUBLIC_KEY_B64, self.store)
+        self.accounts_db = AccountsDb(_app_data_dir(), self.store)
+
+        self.trusted_now, self.state = _require_trusted_time(self.state)
+        self.state = self.accounts_db.ensure_ready(self.state)
+        self.store.save(self.state)
+        self._refresh_labels()
+
+    def _refresh_labels(self) -> None:
+        exp = self.state.expiry_utc or "—"
+        last = self.state.last_trusted_utc or "—"
+        pending = "—"
+        if self.state.pending_db_update:
+            pending = (
+                f"до {self.state.pending_db_update.expires_at_utc} "
+                f"(v{self.state.pending_db_update.target_db_version})"
+            )
+        self.status_machine.set((self.state.machine_id or "—")[:12])
+        self.status_license.set(exp)
+        self.status_db.set(str(self.state.last_db_version))
+        self.status_time.set(last)
+        self.status_pending.set(pending)
+
+    def _set_status(self, text: str) -> None:
+        self.status_bar.set(text)
+
+    def _handle_error(self, title: str, exc: Exception) -> None:
+        from tkinter import messagebox
+
+        messagebox.showerror(title, str(exc), parent=self.root)
+        self._set_status(f"Ошибка: {exc}")
+
+    def refresh_time(self) -> None:
+        try:
+            self.trusted_now, self.state = _require_trusted_time(self.state)
+            self.store.save(self.state)
+            self._refresh_labels()
+            self._set_status("Trusted time обновлено")
+        except Exception as exc:
+            self._handle_error("Trusted time", exc)
+
+    def apply_code(self) -> None:
+        from tkinter import simpledialog
+
+        code = simpledialog.askstring("Код", "Введи код RUN_30D или DB_UPDATE:", parent=self.root)
+        if not code:
+            return
+        try:
+            self.state = self.lic.apply_code(self.state, self.trusted_now, code)
+            self.store.save(self.state)
+            self._refresh_labels()
+            self._set_status("Код принят")
+        except Exception as exc:
+            self._handle_error("Код", exc)
+
+    def _ensure_license(self) -> bool:
+        from tkinter import messagebox
+        from tkinter import simpledialog
+
+        if self.lic.is_active(self.state, self.trusted_now):
+            return True
+        res = messagebox.askyesno(
+            "Лицензия",
+            "Лицензия не активна. Ввести код RUN_30D?",
+            parent=self.root,
+        )
+        if not res:
+            return False
+        code = simpledialog.askstring("Код RUN_30D", "Введи код RUN_30D:", parent=self.root)
+        if not code:
+            return False
+        self.state = self.lic.apply_code(self.state, self.trusted_now, code)
+        self.store.save(self.state)
+        self._refresh_labels()
+        return self.lic.is_active(self.state, self.trusted_now)
+
+    def import_db(self) -> None:
+        from tkinter import filedialog
+        from tkinter import messagebox
+
+        if not self.state.pending_db_update:
+            messagebox.showinfo("Импорт", "Нет активного разрешения. Введи DB_UPDATE код.", parent=self.root)
+            return
+        path = filedialog.askopenfilename(
+            title="Выбери SQLITE базу для импорта",
+            filetypes=[("SQLite", "*.sqlite"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.state = self.accounts_db.import_plain_db(self.state, Path(path))
+            self.store.save(self.state)
+            self._refresh_labels()
+            self._set_status("База обновлена")
+        except Exception as exc:
+            self._handle_error("Импорт базы", exc)
+
+    def run_export(self) -> None:
+        from tkinter import filedialog
+        from tkinter import messagebox
+
+        if not self._ensure_license():
+            messagebox.showinfo("Экспорт", "Лицензия не активирована.", parent=self.root)
+            return
+        try:
+            self.state = self.accounts_db.ensure_ready(self.state)
+            self.store.save(self.state)
+            accounts = self.accounts_db.load_accounts(self.state)
+            if not accounts:
+                messagebox.showinfo(
+                    "Экспорт",
+                    "В базе нет аккаунтов. Импортируй базу через DB_UPDATE код.",
+                    parent=self.root,
+                )
+                return
+            output_path = filedialog.asksaveasfilename(
+                title="Путь для сохранения xlsx",
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx"), ("Все файлы", "*.*")],
+            )
+            if not output_path:
+                output_path = None
+            _run_export(accounts, otp_provider_gui, output_path=output_path)
+            self._set_status("Экспорт завершён")
+        except Exception as exc:
+            self._handle_error("Экспорт", exc)
+
+    def _on_close(self) -> None:
+        self.store.save(self.state)
+        self.root.destroy()
+
+
+def run_cli() -> None:
     _configure_logging()
     root = _app_data_dir()
     store = SecureStateStore(root)
@@ -787,16 +1023,8 @@ def main() -> None:
 
     # 1) Требование: сеть + проверка времени на старте
     print("Проверяю время по сети...")
-    trusted_now = get_trusted_time_utc()
+    trusted_now, state = _require_trusted_time(state)
     print("Доверенное время (UTC):", trusted_now.isoformat())
-
-    # anti-rollback по last_trusted_utc
-    if state.last_trusted_utc:
-        last = datetime.fromisoformat(state.last_trusted_utc)
-        if trusted_now < last - timedelta(seconds=ANTI_ROLLBACK_SKEW_SEC):
-            raise TrustedTimeError("Время 'откатилось' назад относительно сохранённого trusted-time.")
-
-    state.last_trusted_utc = trusted_now.isoformat()
 
     # 2) Подготовка БД (и контроль подмены)
     accounts_db = AccountsDb(root, store)
@@ -844,9 +1072,8 @@ def main() -> None:
 
         if choice == "4":
             print("Обновляю доверенное время...")
-            trusted_now = get_trusted_time_utc()
+            trusted_now, state = _require_trusted_time(state)
             print("Доверенное время (UTC):", trusted_now.isoformat())
-            state.last_trusted_utc = trusted_now.isoformat()
             store.save(state)
             continue
 
@@ -885,13 +1112,50 @@ def main() -> None:
                 print("В базе нет аккаунтов. Импортируй базу через DB_UPDATE код (пункт 3).")
                 continue
 
-            _run_export(accounts)
+            output = input("Путь сохранения xlsx (Enter = спросит диалог/консоль внутри модуля): ").strip() or None
+            _run_export(accounts, otp_provider_interactive, output_path=output)
             print("Готово.")
             continue
 
         print("Не понял пункт меню.")
 
     store.save(state)
+
+
+def run_gui() -> None:
+    import tkinter as tk
+    from tkinter import messagebox
+
+    if PUBLIC_KEY_B64.startswith("PASTE_"):
+        messagebox.showerror(
+            "Настройка",
+            "Не задан PUBLIC_KEY_B64. Вставь публичный ключ Ed25519 в код.",
+        )
+        return
+
+    root = tk.Tk()
+    try:
+        AppUI(root)
+    except Exception as exc:
+        messagebox.showerror("Ошибка", str(exc))
+        root.destroy()
+        return
+    root.mainloop()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Rice HTTP CC Standalone")
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Запуск в консольном режиме",
+    )
+    args = parser.parse_args()
+
+    if args.cli:
+        run_cli()
+    else:
+        run_gui()
 
 
 if __name__ == "__main__":
